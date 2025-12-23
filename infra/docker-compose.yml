@@ -1,0 +1,240 @@
+name: "event management platform"
+services:
+  # --- Application Services ---
+  #  api:
+  #    image: api-image
+  #    container_name: "api"
+  #    ports:
+  #      - "5000:5000"
+  #    networks:
+  #      - app-net
+  #  worker:
+  #    container_name: "worker"
+  #    networks:
+  #      - app-net
+  #  
+  #  frontend:
+  #    container_name: "frontend"
+  #    # build: ./frontend
+  #    ports:
+  #      - "3000:3000"
+  #    networks:
+  #      - app-net
+  
+  # --- Core Infrastructure ---
+  postgres:
+    container_name: "postgres"
+    image: postgres:18.1-alpine
+    platform: linux/amd64
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    networks:
+      - app-net
+    volumes:
+      - postgres-storage:/var/lib/postgresql
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+  
+  redis:
+    container_name: "redis"
+    image: redis:8-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - app-net
+    volumes:
+      - redis-storage:/data
+    restart: always
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.5.21
+    container_name: "etcd"
+    command:
+      - /usr/local/bin/etcd
+      - --name=etcd0
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://etcd:2380
+      - --initial-cluster=etcd0=http://etcd:2380
+      - --initial-cluster-token=etcd-cluster
+      - --initial-cluster-state=new
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    networks:
+      - app-net
+    volumes:
+      - etcd-storage:/etcd-data
+  
+  # --- Streaming / Event Bus ---
+  redpanda-broker:
+    image: redpandadata/redpanda:v25.3.3
+    container_name: "redpanda-broker"
+    environment:
+      - REDPANDA_NODE_ID=${REDPANDA_NODE_ID}
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda-broker:9092,external://localhost:19092
+      - --mode dev-container
+      - --smp 1
+      - --default-log-level=info
+    ports:
+      - "19092:19092"
+    networks:
+      - app-net
+    volumes:
+      - redpanda-storage:/var/lib/redpanda/data
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  redpanda-console:
+    image: redpandadata/console:v3.3.2
+    container_name: "redpanda-console"
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda-broker:9092"]
+    ports:
+      - "8088:8080"
+    networks:
+      - app-net
+    depends_on:
+      - "redpanda-broker"
+  
+  # --- Observability ---
+  prometheus:
+    image: prom/prometheus:v3.8.0
+    container_name: "prometheus"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - app-net
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:12.3.1
+    container_name: "grafana"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GF_SECURITY_ADMIN_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GF_SECURITY_ADMIN_PASSWORD}
+      - GF_SERVER_ROOT_URL=${GF_SERVER_ROOT_URL}
+    ports:
+      - "3001:3000"
+    networks:
+      - app-net
+    volumes:
+      - grafana-storage:/var/lib/grafana
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.80.1-alpine
+    container_name: "redis-exporter"
+    command: [ "--redis.addr=redis:6379" ]
+    ports: [ "9121:9121" ]
+    networks: [ app-net ]
+    restart: unless-stopped
+  
+  # --- CI/CD (Concourse) ---
+
+  concourse-db:
+    image: postgres:18.1-alpine
+    container_name: "concourse-db"
+    environment:
+      POSTGRES_DB: ${CONCOURSE_POSTGRES_DB}
+      POSTGRES_PASSWORD: ${CONCOURSE_POSTGRES_PASSWORD}
+      POSTGRES_USER: ${CONCOURSE_POSTGRES_USER}
+      POSTGRES_HOST_AUTH_METHOD: trust
+    networks:
+      - app-net
+    volumes:
+      - concourse-db-storage:/var/lib/postgresql
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U concourse_user -d concourse" ]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+
+  concourse:
+    image: concourse/concourse:7.11.2
+    container_name: "concourse"
+    command: quickstart
+    privileged: true
+    cgroup: host
+    environment:
+      CONCOURSE_POSTGRES_USER: concourse_user
+      CONCOURSE_POSTGRES_PASSWORD: ${CONCOURSE_POSTGRES_PASSWORD}
+      CONCOURSE_POSTGRES_DATABASE: concourse
+      CONCOURSE_EXTERNAL_URL: http://localhost:8080
+      CONCOURSE_ADD_LOCAL_USER: ${CONCOURSE_ADD_LOCAL_USER}
+      CONCOURSE_MAIN_TEAM_LOCAL_USER: test
+      CONCOURSE_WORKER_BAGGAGECLAIM_DRIVER: overlay
+      CONCOURSE_CLIENT_SECRET: ${CONCOURSE_CLIENT_SECRET}
+      CONCOURSE_TSA_CLIENT_SECRET: ${CONCOURSE_TSA_CLIENT_SECRET}
+      CONCOURSE_CLUSTER_NAME: tutorial
+      CONCOURSE_WORKER_CONTAINERD_DNS_SERVER: "8.8.8.8"
+      CONCOURSE_WORKER_RUNTIME: "containerd"
+      CONCOURSE_ENABLE_PIPELINE_INSTANCES: "true"
+      CONCOURSE_ENABLE_ACROSS_STEP: "true"
+      CONCOURSE_ENABLE_RESOURCE_CAUSALITY: "true"
+    ports:
+      - "8080:8080"
+    networks:
+      - app-net
+    volumes:
+      - concourse-keys:/concourse-keys
+      - concourse-work-dir:/opt/concourse/worker
+    restart: unless-stopped
+    depends_on:
+      concourse-db:
+        condition: service_healthy
+
+networks:
+  app-net:
+    driver: bridge
+
+volumes:
+  postgres-storage:
+  redis-storage:
+  etcd-storage:
+  redpanda-storage:
+  grafana-storage:
+  prometheus-data:
+  concourse-db-storage:
+  concourse-keys:
+  concourse-work-dir:
